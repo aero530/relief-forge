@@ -274,11 +274,11 @@ impl Albedo {
         Self {
             w,
             h,
-            rgb: rgb
-                .as_raw()
-                .chunks_exact(3)
-                .map(|c| [c[0], c[1], c[2]])
-                .collect(),
+            // `as_chunks` rather than `chunks_exact(3).map(...)`: the bytes are
+            // already triples, so this reinterprets them in place instead of
+            // rebuilding each one through a closure. The remainder it returns is
+            // empty by construction — `to_rgb8` gives three bytes per pixel.
+            rgb: rgb.as_raw().as_chunks::<3>().0.to_vec(),
         }
     }
 
