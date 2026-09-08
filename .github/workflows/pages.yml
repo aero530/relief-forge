@@ -1,11 +1,11 @@
 name: Web demo
 
-# The demo tracks the default branch rather than releases: it costs nothing to
+# The demo tracks main rather than releases: it costs nothing to
 # rebuild, and a demo that lags the desktop app by a release is worse than no
 # demo.
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 # One deployment at a time, and let a newer push win — a queued build of an older
