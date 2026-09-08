@@ -1,0 +1,7 @@
+/target
+/dist
+Cargo.lock.bak
+*.stl
+*.obj
+*.ply
+!/crates/relief-core/tests/fixtures/*

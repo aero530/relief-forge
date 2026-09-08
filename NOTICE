@@ -1,0 +1,16 @@
+Relief Forge is a Rust rewrite of the geometry in:
+
+    prs-eth/depth-to-3d-print
+    https://huggingface.co/spaces/prs-eth/depth-to-3d-print
+    Copyright 2023-2025 Marigold Team, ETH Zurich
+    Licensed under the Apache License, Version 2.0
+
+The pipeline that file describes — median filter, min/max normalisation, a
+near/far depth window, a height-field grid, and a frame of skirt, bezel, wall
+and back plate — is reimplemented here, with the parameter names and ranges
+kept so that settings and published examples transfer. No code was copied; the
+Rust implementation streams rather than buffering, shares its seam indices
+rather than merging duplicates afterwards, and fixes the three defects listed
+in README.md.
+
+Apache-2.0 is available at http://www.apache.org/licenses/LICENSE-2.0

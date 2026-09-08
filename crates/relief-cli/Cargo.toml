@@ -1,0 +1,19 @@
+[package]
+name = "relief-cli"
+description = "Headless batch conversion of depth maps to printable relief meshes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "relief"
+path = "src/main.rs"
+
+[dependencies]
+relief-core.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+image.workspace = true

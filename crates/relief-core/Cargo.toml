@@ -1,0 +1,20 @@
+[package]
+name = "relief-core"
+description = "Depth map to watertight bas-relief geometry: decode, condition, mesh, export."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam.workspace = true
+image.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+# Row-parallel filtering and normal generation. Not available on wasm (no
+# threads without cross-origin isolation), where the serial path runs instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.12"

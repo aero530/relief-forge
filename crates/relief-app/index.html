@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Relief Forge</title>
+
+    <!-- data-wasm-opt="0" disables wasm-opt; trunk 0.20 cannot drive a Binaryen
+         that accepts current rustc output. See the note in Trunk.toml.
+
+         data-initializer points at loader.js, which drives the overlay below
+         from trunk's download callbacks. -->
+    <link data-trunk rel="rust" data-wasm-opt="0" data-initializer="loader.js" />
+
+    <!-- Inline so there is no second request and no 404 for a file that does
+         not exist yet: a stepped relief in section. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23191c1e'/%3E%3Cpath d='M4 24h4v-6h4v-5h4V8h4v5h4v5h4v6z' fill='%23e9a542'/%3E%3C/svg%3E"
+    />
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #191c1e;
+        font-family: system-ui, sans-serif;
+        color: #d7dcde;
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+
+      /* Bevy's wasm bundle is multiple megabytes; never show a blank page while
+         it downloads. */
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        pointer-events: none;
+      }
+
+      #loading.hidden {
+        display: none;
+      }
+
+      .spinner {
+        width: 2.5rem;
+        height: 2.5rem;
+        border: 3px solid #3a4144;
+        border-top-color: #e9a542;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .spinner {
+          animation-duration: 3s;
+        }
+      }
+
+      #loading-detail {
+        font-size: 0.85rem;
+        color: #8d9498;
+        /* Reserve the line so the overlay does not jump as the text changes. */
+        min-height: 1.2em;
+      }
+
+      #loading-bar {
+        width: min(18rem, 60vw);
+        height: 4px;
+        background: #3a4144;
+        border-radius: 2px;
+        overflow: hidden;
+      }
+
+      #loading-bar[hidden] {
+        display: none;
+      }
+
+      #loading-fill {
+        height: 100%;
+        width: 0;
+        background: #e9a542;
+        transition: width 0.15s linear;
+      }
+
+      #hint {
+        position: fixed;
+        bottom: 0.6rem;
+        left: 0;
+        right: 0;
+        text-align: center;
+        font-size: 0.72rem;
+        color: #6d757a;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="loading">
+      <div class="spinner"></div>
+      <div>Loading Relief Forge…</div>
+      <div id="loading-bar" hidden><div id="loading-fill"></div></div>
+      <div id="loading-detail"></div>
+    </div>
+
+    <canvas id="relief-canvas"></canvas>
+
+    <div id="hint">exports stream to a download — nothing is uploaded anywhere</div>
+
+    <script>
+      // Bevy resizes the canvas once it takes over; that is our cue to drop the
+      // loading overlay even if the initializer hook never fires. Falls back to
+      // a timeout so it can never get stuck.
+      const overlay = document.getElementById('loading');
+      const canvas = document.getElementById('relief-canvas');
+      const done = () => overlay.classList.add('hidden');
+      new ResizeObserver((entries) => {
+        if (entries.some((e) => e.contentRect.width > 0 && e.contentRect.height > 0)) done();
+      }).observe(canvas);
+      setTimeout(done, 30000);
+    </script>
+  </body>
+</html>
