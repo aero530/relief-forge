@@ -35,8 +35,11 @@ jobs:
         run: |
           set -o pipefail
           if ! cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.txt; then
-            grep -E ' (error|warning)(\[[A-Za-z0-9]+\])?: ' clippy.txt | head -40 |
-              while IFS= read -r line; do echo "::error::${line}"; done
+            # No filtering: a pattern that misses (a build-script failure, a
+            # link error) leaves the run saying only "exit code 1" again.
+            tail -n 40 clippy.txt | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::${line}"
+            done
             exit 1
           fi
       - run: cargo test --workspace
