@@ -18,12 +18,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # bevy_winit's Wayland backend links these at build time; the X11 backend
-      # loads its libraries at runtime and needs nothing here.
+      # bevy_winit's Wayland backend links the first two at build time; the X11
+      # backend loads its libraries at runtime and needs nothing here.
+      #
+      # libudev is for gamepad support, which this app has no use for and does
+      # not ask for: bevy_panorbit_camera depends on bevy with default features,
+      # and cargo unifies those with ours, so bevy_gilrs — and its libudev-sys —
+      # arrive whatever relief-app's own feature list says.
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev
       - run: cargo fmt --all --check
       # Clippy's own output only reaches the log, which needs a token to read —
       # so a red tick tells you nothing without one. Re-emitting each diagnostic
