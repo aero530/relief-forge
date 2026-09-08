@@ -39,12 +39,22 @@ jobs:
       - name: cargo clippy
         run: |
           set -o pipefail
-          if ! cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.txt; then
-            # No filtering: a pattern that misses (a build-script failure, a
-            # link error) leaves the run saying only "exit code 1" again.
-            tail -n 40 clippy.txt | while IFS= read -r line; do
-              [ -n "$line" ] && echo "::error::${line}"
-            done
+          if ! cargo clippy --workspace --all-targets --message-format=short -- \
+               -D warnings 2>&1 | tee clippy.txt; then
+            # One annotation carrying many lines, rather than one per line:
+            # GitHub keeps at most ten annotations per step, so a line-per-line
+            # dump silently loses the tail — which is exactly where the error is.
+            # `%0A` is how a workflow command embeds a newline.
+            python3 - <<'PY'
+          import re
+          noise = re.compile(r'^\s*(Compiling|Checking|Downloading|Downloaded|'
+                             r'Updating|Fresh|Blocking|Building|Finished)\b')
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          lines = [ansi.sub('', line.rstrip())
+                   for line in open('clippy.txt', errors='replace')]
+          keep = [line for line in lines if line.strip() and not noise.match(line)]
+          print('::error::' + '%0A'.join(keep[-40:]))
+          PY
             exit 1
           fi
       - run: cargo test --workspace
