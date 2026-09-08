@@ -7,8 +7,20 @@ address = "127.0.0.1"
 port = 8080
 open = false
 
-# wasm-opt is disabled via data-wasm-opt="0" in index.html: trunk 0.20.1 cannot
-# drive a Binaryen that accepts current rustc output (116 rejects the bulk-memory
-# instructions rustc emits, 123 wants --enable-bulk-memory-opt which trunk 0.20
-# never passes). Costs a few MB of download on the demo build. The fix is trunk
-# >= 0.21, at which point the attribute can go.
+# wasm-opt is disabled via data-wasm-opt="0" in index.html, and stays that way
+# on trunk 0.21.14 with Binaryen 123. The blocker is not the version: rustc emits
+# `memory.copy` and `i64.trunc_sat_f64_u`, Binaryen refuses both unless features
+# are enabled, and trunk has no parameter passthrough — `trunk config show`
+# offers an optimisation level and nothing else. Turning it on fails the build.
+#
+# .github/workflows/pages.yml runs `wasm-opt -Oz -all` on the output instead.
+# Measured on this app, that is worth less than it sounds:
+#
+#     rustc output      51.2 MB raw   12.3 MB gzip
+#     wasm-opt -O  -all 45.9 MB raw   12.2 MB gzip
+#     wasm-opt -Oz -all 32.8 MB raw   11.9 MB gzip
+#
+# A third off the module but 3% off the download: what a visitor waits for is
+# mostly incompressible either way. The gain is parse and compile time in the
+# browser, and peak memory in the tab — which is worth having on a page whose
+# whole job is to run a renderer.

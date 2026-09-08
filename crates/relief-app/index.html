@@ -5,8 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
     <title>Relief Forge</title>
 
-    <!-- data-wasm-opt="0" disables wasm-opt; trunk 0.20 cannot drive a Binaryen
-         that accepts current rustc output. See the note in Trunk.toml.
+    <!-- data-wasm-opt="0" disables *trunk's* wasm-opt, which cannot work here:
+         rustc emits memory.copy and i64.trunc_sat_f64_u, Binaryen rejects both
+         without `-all`, and trunk exposes no way to pass extra parameters — only
+         an optimisation level. The Pages workflow runs wasm-opt itself instead.
 
          data-initializer points at loader.js, which drives the overlay below
          from trunk's download callbacks. -->

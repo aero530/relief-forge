@@ -43,11 +43,26 @@ jobs:
       - name: Build
         run: trunk build --release --public-url "/${GITHUB_REPOSITORY#*/}/"
 
+      # trunk cannot run wasm-opt on current rustc output (see Trunk.toml), so
+      # it runs here. `-all` is the whole point: without it Binaryen rejects the
+      # `memory.copy` and `i64.trunc_sat_f64_u` rustc emits. Worth ~a third of
+      # the module's size, which is parse time and tab memory rather than
+      # download — the next step prints both so the trade stays visible.
+      - name: Optimise the wasm
+        run: |
+          sudo apt-get install -y binaryen
+          wasm-opt --version
+          for module in dist/*_bg.wasm; do
+            before=$(stat -c %s "$module")
+            wasm-opt -Oz -all --output "$module.opt" "$module"
+            mv "$module.opt" "$module"
+            after=$(stat -c %s "$module")
+            echo "$(basename "$module"): $before -> $after bytes"
+          done
+
       # GitHub Pages serves brotli and gzip from its own edge, so nothing needs
-      # pre-compressing here — but the wasm is tens of megabytes and it is worth
-      # knowing what visitors actually pay. `wasm-opt` is disabled in index.html
-      # (see Trunk.toml); enabling it needs trunk >= 0.21 everywhere, and would
-      # cut this substantially.
+      # pre-compressing here — but the wasm is megabytes either way and it is
+      # worth knowing what visitors actually pay.
       - name: Report transfer size
         run: |
           {

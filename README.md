@@ -115,9 +115,11 @@ Settings JSON is shared between the GUI and `--settings`.
 - **WebGL2 only.** Bevy cannot pick a backend at runtime
   ([bevyengine/bevy#13168](https://github.com/bevyengine/bevy/issues/13168)), so
   one bundle has to choose, and WebGL2 is the one that runs in Firefox too.
-- **The web bundle is large.** trunk 0.20.1 cannot drive a Binaryen that accepts
-  current rustc output, so `wasm-opt` is disabled (see `Trunk.toml`). trunk 0.21 is
-  out and would let it back on; until then the demo build carries a few extra MB.
+- **The web bundle is large, and wasm-opt barely helps.** 51 MB of wasm, 12 MB
+  over the wire. `wasm-opt -Oz -all` takes the module to 33 MB but the download
+  only to 11.9 MB — a third off the parse, 3% off the wait. The Pages workflow
+  runs it for the parse-time gain; trunk cannot (see `Trunk.toml`). Getting the
+  download down means a smaller bevy, not a better optimiser.
 - **Simplification is a quadtree, not a TIN.** Greedy Delaunay insertion
   (Garland–Heckbert's terrain paper) reaches the same tolerance in fewer
   triangles, at the cost of holding the output triangulation in memory. Worth
