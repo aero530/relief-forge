@@ -96,14 +96,18 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, now: f64) {
     ui.horizontal_wrapped(|ui| {
         if ui
             .button("Open depth…")
-            .on_hover_text("16-bit PNG, 8-bit PNG, or JPEG")
+            .on_hover_text(
+                "16-bit PNG, 8-bit PNG, JPEG, or an SVG drawing with a height layer and a cutout layer",
+            )
             .clicked()
         {
             platform::open(&state.inbox, PickKind::Depth);
         }
+        let cut = state.cut().is_some();
         if ui
-            .button("Open image…")
+            .add_enabled(!cut, egui::Button::new("Open image…"))
             .on_hover_text("A photo to colour the relief with. Must match the depth map's shape.")
+            .on_disabled_hover_text("A photo cannot colour a cutout drawing.")
             .clicked()
         {
             platform::open(&state.inbox, PickKind::Photo);
@@ -218,7 +222,13 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
             ui.label(format!(
                 "{}{}",
                 stats.bbox_line(),
-                if stats.framed { "" } else { " · no frame" }
+                if stats.pieces > 1 {
+                    format!(" · {} pieces", stats.pieces)
+                } else if stats.framed && state.cut().is_none() {
+                    String::new()
+                } else {
+                    " · no frame".into()
+                }
             ));
         });
     });
@@ -273,8 +283,67 @@ fn percent(ui: &mut egui::Ui, label: &str, tooltip: &str, value: &mut f32) -> bo
     changed
 }
 
+/// The drawing's layers, when the depth came from an SVG.
+fn drawing_section(ui: &mut egui::Ui, state: &mut AppState, now: f64) {
+    let Some(source) = &state.drawing else {
+        return;
+    };
+    let layers = source.drawing.layers().to_vec();
+    let (mut height, mut cutout) = (source.height, source.cutout);
+
+    ui.add_space(6.0);
+    ui.heading("Drawing");
+    row(
+        ui,
+        "Height layer",
+        "The layer whose image — or gray shapes and gradients — gives the heights.",
+        |ui| {
+            let mut response = egui::ComboBox::from_id_salt("height-layer")
+                .selected_text(&layers[height].label)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for (k, layer) in layers.iter().enumerate() {
+                        ui.selectable_value(&mut height, k, layer.summary());
+                    }
+                })
+                .response;
+            if height != source.height {
+                response.mark_changed();
+            }
+            response
+        },
+    );
+    row(
+        ui,
+        "Cutout layer",
+        "The layer whose shapes are the outline the model is cut to. Holes and separate pieces follow the fill rule; each piece exports as its own file. Hidden layers work.",
+        |ui| {
+            let selected = cutout.map_or("none — rectangle".to_string(), |k| {
+                layers[k].label.clone()
+            });
+            egui::ComboBox::from_id_salt("cutout-layer")
+                .selected_text(selected)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut cutout, None, "none — a plain rectangle");
+                    for (k, layer) in layers.iter().enumerate() {
+                        ui.selectable_value(&mut cutout, Some(k), layer.summary());
+                    }
+                })
+                .response
+        },
+    );
+    if (height, cutout) != (source.height, source.cutout) {
+        state.choose_layers(height, cutout, now);
+    }
+}
+
 fn settings(ui: &mut egui::Ui, state: &mut AppState, now: f64) {
+    drawing_section(ui, state, now);
     let mut changed = false;
+    let cut_size = state
+        .cut()
+        .map(|c| [c.size_mm[0] as f32, c.size_mm[1] as f32]);
     let bits = state.depth.map.bits;
     // Read what the last build measured before borrowing the parameters, so the
     // grid, pitch and simplification result can be shown next to the controls
@@ -361,19 +430,34 @@ fn settings(ui: &mut egui::Ui, state: &mut AppState, now: f64) {
 
     ui.add_space(6.0);
     ui.heading("Size and detail");
-    changed |= row(
-        ui,
-        "Printed size",
-        "Longest outer side of the finished plaque, frame included.",
-        |ui| {
-            ui.add(
-                egui::Slider::new(&mut p.size_mm, SIZE_MM_MIN..=SIZE_MM_MAX)
-                    .fixed_decimals(0)
-                    .step_by(1.0)
-                    .suffix(" mm"),
-            )
-        },
-    );
+    if let Some([w, h]) = cut_size {
+        changed |= row(
+            ui,
+            "Drawing size",
+            "Print the outline at the size the drawing says. Untick to scale its longest side to Printed size instead — for a drawing whose units came out wrong.",
+            |ui| ui.checkbox(&mut p.use_drawing_size, format!("{w:.1} × {h:.1} mm")),
+        );
+    }
+    let sized_by_drawing = cut_size.is_some() && p.use_drawing_size;
+    ui.add_enabled_ui(!sized_by_drawing, |ui| {
+        changed |= row(
+            ui,
+            "Printed size",
+            if cut_size.is_some() {
+                "Longest side of the cutout's outline, when not using the drawing's own size."
+            } else {
+                "Longest outer side of the finished plaque, frame included."
+            },
+            |ui| {
+                ui.add(
+                    egui::Slider::new(&mut p.size_mm, SIZE_MM_MIN..=SIZE_MM_MAX)
+                        .fixed_decimals(0)
+                        .step_by(1.0)
+                        .suffix(" mm"),
+                )
+            },
+        );
+    });
     changed |= row(
         ui,
         "Mesh resolution",
@@ -456,6 +540,18 @@ fn settings(ui: &mut egui::Ui, state: &mut AppState, now: f64) {
 
     ui.add_space(6.0);
     ui.heading("Frame");
+    let cut = cut_size.is_some();
+    if cut {
+        ui.horizontal(|ui| {
+            ui.add_space(LABEL_WIDTH);
+            ui.label(
+                egui::RichText::new("cut to the drawing's outline — no frame")
+                    .small()
+                    .weak(),
+            );
+        });
+    }
+    ui.add_enabled_ui(!cut, |ui| {
     changed |= row(
         ui,
         "Thickness",
@@ -469,8 +565,9 @@ fn settings(ui: &mut egui::Ui, state: &mut AppState, now: f64) {
             )
         },
     );
-    let framed = p.framed();
-    if !framed {
+    });
+    let framed = p.framed() && !cut;
+    if !framed && !cut {
         ui.horizontal(|ui| {
             ui.add_space(LABEL_WIDTH);
             ui.label(

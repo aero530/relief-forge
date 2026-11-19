@@ -13,7 +13,9 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
+use relief_core::cutout::{CutRelief, Cutout};
 use relief_core::depth::Albedo;
+use relief_core::export::Format;
 use relief_core::params::Params;
 use relief_core::{Decimation, DepthMap, Solid, Stats, export, tiles};
 
@@ -25,6 +27,7 @@ use crate::state::{
 /// Everything a build needs, detached from the ECS so it can cross a thread.
 struct Job {
     depth: Arc<DepthMap>,
+    cut: Option<Arc<Cutout>>,
     photo: Option<Photo>,
     params: Params,
 }
@@ -33,6 +36,7 @@ impl Job {
     fn new(state: &AppState) -> Self {
         Self {
             depth: state.depth.map.clone(),
+            cut: state.cut().cloned(),
             photo: state.photo.clone(),
             params: state.preview_params(),
         }
@@ -40,6 +44,19 @@ impl Job {
 
     /// The actual work: condition, colour, chunk.
     fn run(self) -> Result<Built, String> {
+        if let Some(cut) = &self.cut {
+            let relief = cut.build(&self.params).map_err(|e| e.to_string())?;
+            let stats = cut_stats(&relief, Format::Stl, &self.params);
+            let mut tiles = Vec::new();
+            for piece in &relief.pieces {
+                tiles.extend(tiles::preview(&piece.solid(), TILE_VERTS));
+            }
+            return Ok(Built {
+                field: Arc::new(relief.field),
+                stats,
+                tiles,
+            });
+        }
         let field = self
             .depth
             .to_height_field(&self.params)
@@ -68,6 +85,21 @@ impl Job {
             tiles,
         })
     }
+}
+
+/// Every piece's numbers, totalled over the drawing.
+fn cut_stats(relief: &CutRelief, format: Format, params: &Params) -> Stats {
+    let parts: Vec<Stats> = relief
+        .pieces
+        .iter()
+        .map(|p| Stats::new(&p.solid(), format, params))
+        .collect();
+    Stats::combine(
+        &parts,
+        (relief.field.w, relief.field.h),
+        relief.extents_mm(params),
+    )
+    .expect("a built cutout has at least one piece")
 }
 
 /// Desktop: hand the job to the compute pool and pick it up when it lands.
@@ -178,6 +210,43 @@ pub fn export_now(state: &mut AppState) {
     let params = state.params;
     let format = state.format;
 
+    if let Some(cut) = state.cut().cloned() {
+        let relief = match cut.build(&params) {
+            Err(e) => {
+                state.status = Status::error(e.to_string());
+                return;
+            }
+            Ok(relief) => relief,
+        };
+        let stats = cut_stats(&relief, format, &params);
+        let name = state.suggested_name();
+        let count = relief.pieces.len();
+        let outcome = platform::save_streams(&name, count, |k, sink| {
+            export::write(format, &relief.pieces[k].solid(), sink, &mut |_| {})
+                .map_err(|e| e.to_string())
+        });
+        let what = if count == 1 {
+            String::new()
+        } else {
+            format!("{count} pieces, ")
+        };
+        state.status = match outcome {
+            Err(message) => Status::error(message),
+            Ok(Saved::Cancelled) => Status::info("Export cancelled"),
+            Ok(Saved::Downloaded) => Status::info(format!(
+                "Downloaded {what}{} triangles, {}",
+                stats.triangles,
+                stats.file_line()
+            )),
+            Ok(Saved::To(path)) => Status::info(format!(
+                "Wrote {path} — {what}{} triangles, {}",
+                stats.triangles,
+                stats.file_line()
+            )),
+        };
+        return;
+    }
+
     let field = match state.depth.map.to_height_field(&params) {
         Err(e) => {
             state.status = Status::error(e.to_string());
@@ -233,6 +302,7 @@ pub fn load_sample(state: &mut AppState, eight_bit: bool, now: f64) {
         name: name.into(),
         map: Arc::new(sample::depth_map_with(1536, 1152, bits)),
     };
+    state.drawing = None;
     state.photo = None;
     state.photo_texture = None;
     state.status = Status::info(if eight_bit {
@@ -265,7 +335,11 @@ pub fn preview_note(state: &AppState) -> String {
         None => "building…".into(),
         Some(built) => {
             let (w, h) = built.stats.grid;
-            let tiles = built.tiles.len().saturating_sub(1);
+            let tiles = built
+                .tiles
+                .iter()
+                .filter(|t| t.kind == tiles::TileKind::Surface)
+                .count();
             let capped = state.params.size_px > PREVIEW_MAX_PX;
             format!(
                 "preview {w}×{h} in {tiles} chunk{}{}",

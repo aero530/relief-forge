@@ -98,6 +98,7 @@ pub fn depth_map_with(width: u32, height: u32, bits: BitDepth) -> DepthMap {
         bits,
         was_colour: false,
         data,
+        coverage: None,
     }
 }
 

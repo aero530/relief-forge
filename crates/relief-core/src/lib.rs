@@ -44,13 +44,17 @@
 //! [`Orientation::Upright`] rotates anything.
 
 pub mod check;
+pub mod cutout;
 pub mod decimate;
 pub mod depth;
 pub mod export;
 pub mod mesh;
+pub mod outline;
 pub mod params;
 pub mod sample;
+pub mod shape;
 pub mod stats;
+pub mod svg;
 pub mod tiles;
 
 pub use decimate::Decimation;
@@ -84,6 +88,12 @@ pub enum Error {
         depth_w: u32,
         depth_h: u32,
     },
+
+    #[error("{0}")]
+    Outline(String),
+
+    #[error("that drawing could not be read: {0}")]
+    Svg(String),
 
     #[error("writing the mesh failed: {0}")]
     Io(#[from] std::io::Error),

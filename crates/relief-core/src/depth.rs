@@ -44,6 +44,15 @@ pub struct DepthMap {
     /// True when the source had colour, so the luma conversion was a guess.
     pub was_colour: bool,
     pub data: Vec<f32>,
+    /// How much of each pixel the source actually covers, `0.0..=1.0`, or
+    /// `None` when it all does.
+    ///
+    /// A plain image always covers itself. A height layer taken from a drawing
+    /// generally does not: the cutout can reach past the embedded image, and a
+    /// vector layer leaves transparent gaps. Uncovered pixels become the back
+    /// of the relief — its deepest level, the top of the back plate — rather
+    /// than whatever value happens to sit in `data` there.
+    pub coverage: Option<Vec<f32>>,
 }
 
 impl DepthMap {
@@ -89,17 +98,12 @@ impl DepthMap {
             bits,
             was_colour,
             data,
+            coverage: None,
         })
     }
 
     pub fn aspect(&self) -> f32 {
         self.width as f32 / self.height as f32
-    }
-
-    fn at(&self, x: usize, y: usize) -> f32 {
-        let x = x.min(self.width as usize - 1);
-        let y = y.min(self.height as usize - 1);
-        self.data[y * self.width as usize + x]
     }
 
     /// Bilinear resample to `(w, h)`.
@@ -113,37 +117,14 @@ impl DepthMap {
             return self.clone();
         }
 
-        let mut out = vec![0.0f32; w * h];
-        // Map destination centres onto source centres: the -1/-1 form puts the
-        // first and last destination samples exactly on the first and last
-        // source pixels, which keeps the relief's edges where they were.
-        let sx = (self.width as f32 - 1.0) / (w as f32 - 1.0);
-        let sy = (self.height as f32 - 1.0) / (h as f32 - 1.0);
-
-        each_row_mut(&mut out, w, |j, row| {
-            let fy = j as f32 * sy;
-            let y0 = fy.floor() as usize;
-            let ty = fy - y0 as f32;
-            for (i, slot) in row.iter_mut().enumerate() {
-                let fx = i as f32 * sx;
-                let x0 = fx.floor() as usize;
-                let tx = fx - x0 as f32;
-                let a = self.at(x0, y0);
-                let b = self.at(x0 + 1, y0);
-                let c = self.at(x0, y0 + 1);
-                let d = self.at(x0 + 1, y0 + 1);
-                let top = a + (b - a) * tx;
-                let bottom = c + (d - c) * tx;
-                *slot = top + (bottom - top) * ty;
-            }
-        });
-
+        let (sw, sh) = (self.width as usize, self.height as usize);
         Self {
             width: w as u32,
             height: h as u32,
             bits: self.bits,
             was_colour: self.was_colour,
-            data: out,
+            data: bilinear(&self.data, sw, sh, w, h),
+            coverage: self.coverage.as_ref().map(|c| bilinear(c, sw, sh, w, h)),
         }
     }
 
@@ -176,6 +157,25 @@ impl DepthMap {
                 *x = 1.0 - *x;
             }
         }
+        // Where the source has nothing to say, stand in the deepest value it
+        // does have, so the filters below see background rather than a cliff
+        // to whatever arbitrary value was stored there. The final depth of
+        // those pixels is forced after conditioning; this only keeps them from
+        // bleeding into their covered neighbours.
+        let covered = |k: usize| self.coverage.as_ref().is_none_or(|c| c[k] >= 0.5);
+        if let Some(coverage) = &self.coverage {
+            let deep = v
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| covered(k))
+                .map(|(_, &x)| x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let deep = if deep.is_finite() { deep } else { 1.0 };
+            for (x, &c) in v.iter_mut().zip(coverage) {
+                let c = c.clamp(0.0, 1.0);
+                *x = *x * c + deep * (1.0 - c);
+            }
+        }
         // 8-bit only: 16-bit input has no staircase worth breaking, and blurring
         // it would only cost detail.
         if params.presmooth > 0.0 && self.bits == BitDepth::Eight {
@@ -185,11 +185,16 @@ impl DepthMap {
             v = median(&v, w, h, params.filter_size as usize);
         }
 
+        // Normalised over the covered pixels only: the stand-in background
+        // must not stretch or squash the range of the real data.
         let (lo, hi) = v
             .iter()
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &x| {
+            .enumerate()
+            .filter(|&(k, _)| covered(k))
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), (_, &x)| {
                 (lo.min(x), hi.max(x))
             });
+        let (lo, hi) = if lo.is_finite() { (lo, hi) } else { (0.0, 1.0) };
         let span = if hi > lo { hi - lo } else { 1.0 };
         let window = params.far - params.near;
 
@@ -200,6 +205,14 @@ impl DepthMap {
             // to the full emboss height.
             *x = -params.emboss_mm * (t - params.near) / window;
         }
+        // Uncovered means the back of the relief, exactly: the top of the back
+        // plate. A partly covered pixel on the source's edge blends towards it.
+        if let Some(coverage) = &self.coverage {
+            for (x, &c) in z.iter_mut().zip(coverage) {
+                let c = c.clamp(0.0, 1.0);
+                *x = *x * c - params.emboss_mm * (1.0 - c);
+            }
+        }
 
         HeightField {
             w,
@@ -208,6 +221,37 @@ impl DepthMap {
             bits: self.bits,
         }
     }
+}
+
+/// Bilinear resample of a `sw × sh` grid to `w × h`, in f32 throughout.
+///
+/// Destination centres map onto source centres in the -1/-1 form, which puts
+/// the first and last destination samples exactly on the first and last source
+/// pixels and so keeps the relief's edges where they were.
+fn bilinear(src: &[f32], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f32> {
+    let at = |x: usize, y: usize| src[y.min(sh - 1) * sw + x.min(sw - 1)];
+    let mut out = vec![0.0f32; w * h];
+    let sx = (sw as f32 - 1.0) / (w as f32 - 1.0);
+    let sy = (sh as f32 - 1.0) / (h as f32 - 1.0);
+
+    each_row_mut(&mut out, w, |j, row| {
+        let fy = j as f32 * sy;
+        let y0 = fy.floor() as usize;
+        let ty = fy - y0 as f32;
+        for (i, slot) in row.iter_mut().enumerate() {
+            let fx = i as f32 * sx;
+            let x0 = fx.floor() as usize;
+            let tx = fx - x0 as f32;
+            let a = at(x0, y0);
+            let b = at(x0 + 1, y0);
+            let c = at(x0, y0 + 1);
+            let d = at(x0 + 1, y0 + 1);
+            let top = a + (b - a) * tx;
+            let bottom = c + (d - c) * tx;
+            *slot = top + (bottom - top) * ty;
+        }
+    });
+    out
 }
 
 /// A conditioned height field: `z` in millimetres, `-emboss_mm..=0`.
@@ -399,6 +443,34 @@ mod tests {
             bits: BitDepth::Sixteen,
             was_colour: false,
             data,
+            coverage: None,
+        }
+    }
+
+    #[test]
+    fn uncovered_pixels_sit_on_the_back_plate_and_do_not_skew_the_range() {
+        let p = Params {
+            emboss_mm: 10.0,
+            filter_size: 1,
+            ..Params::default()
+        };
+        let mut map = ramp(9, 3);
+        // Cover only the middle third, and park a wild value in the hole.
+        let mut coverage = vec![0.0f32; 27];
+        for j in 0..3 {
+            for i in 3..6 {
+                coverage[j * 9 + i] = 1.0;
+            }
+        }
+        map.data[0] = 1000.0;
+        map.coverage = Some(coverage);
+        let field = map.condition(&p);
+        // The covered ramp still spans the whole emboss depth on its own...
+        assert!(field.at(3, 1).abs() < 1e-5, "{}", field.at(3, 1));
+        assert!((field.at(5, 1) + 10.0).abs() < 1e-4, "{}", field.at(5, 1));
+        // ...and everything outside it is the back of the relief.
+        for i in [0, 1, 2, 6, 7, 8] {
+            assert!((field.at(i, 1) + 10.0).abs() < 1e-5, "column {i}");
         }
     }
 
@@ -473,8 +545,8 @@ mod tests {
     fn resize_preserves_the_corners() {
         let src = ramp(9, 9);
         let out = src.resized(5, 5);
-        assert!((out.at(0, 0) - 0.0).abs() < 1e-6);
-        assert!((out.at(4, 0) - 1.0).abs() < 1e-6);
+        assert!((out.data[0] - 0.0).abs() < 1e-6);
+        assert!((out.data[4] - 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -247,7 +247,7 @@ pub fn sync_chunks(
     // `show_tiles` changes materials rather than geometry, but it is cheap
     // enough to fold into the same path.
     let generation =
-        state.generation * 4 + u64::from(state.show_tiles) * 2 + u64::from(state.params.framed());
+        state.generation * 4 + u64::from(state.show_tiles) * 2 + u64::from(state.framed());
     let photo_changed = match (&state.photo_texture, &viewport.textured) {
         (Some(handle), Some((baked, _))) => handle != baked,
         (Some(_), None) | (None, Some(_)) => true,
@@ -285,7 +285,7 @@ pub fn sync_chunks(
     // With no bezel the sides and back plate are not a frame, they are the body
     // of the plaque; giving them their own shade would draw a border that the
     // print does not have.
-    let framed = state.params.framed();
+    let framed = state.framed();
     let mut surface_index = 0usize;
     for tile in &built.tiles {
         let material = match tile.kind {

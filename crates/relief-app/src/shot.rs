@@ -5,6 +5,9 @@
 //! person driving it: for the README, and as the only way to catch a UI that
 //! compiles, runs, and draws nothing.
 //!
+//! `RELIEF_OPEN=drawing.svg` opens a file first, exactly as the Open depth
+//! button would, so a shot can show something other than the sample.
+//!
 //! Desktop only — there is no filesystem to save into on the web.
 
 use bevy::prelude::*;
@@ -24,11 +27,36 @@ pub struct Shot {
 
 /// Install the screenshot system when `RELIEF_SHOT` names a file.
 pub fn plugin(app: &mut App) {
+    if std::env::var("RELIEF_OPEN").is_ok() {
+        app.add_systems(PostStartup, open_from_env);
+    }
     let Ok(path) = std::env::var("RELIEF_SHOT") else {
         return;
     };
     app.insert_resource(Shot { path, frame: 0 })
         .add_systems(Last, capture);
+}
+
+/// Deliver `RELIEF_OPEN` to the inbox, after the restored settings.
+fn open_from_env(state: Res<crate::state::AppState>) {
+    use crate::platform::{Opened, PickKind};
+    let Ok(path) = std::env::var("RELIEF_OPEN") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    state.inbox.put(
+        std::fs::read(&path)
+            .map(|bytes| Opened::File {
+                kind: PickKind::Depth,
+                name,
+                bytes,
+            })
+            .map_err(|e| format!("{}: {e}", path.display())),
+    );
 }
 
 fn capture(

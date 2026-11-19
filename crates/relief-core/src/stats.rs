@@ -55,6 +55,9 @@ pub struct Stats {
     pub format: Format,
     /// The unit the exported file's numbers will be written in.
     pub export_units: Units,
+    /// Separate solids these numbers cover: more than one only for a cutout
+    /// with several pieces, where counts, volume and size are totals.
+    pub pieces: usize,
 }
 
 impl Stats {
@@ -73,7 +76,7 @@ impl Stats {
             relief_mm,
             pitch_mm: layout.pitch_mm,
             framed: layout.framed(),
-            full_triangles: layout.triangle_count(),
+            full_triangles: solid.full_triangle_count(),
             tolerance_mm: params.tolerance_mm,
             achieved_error_mm: solid.decimation().map_or(0.0, |d| d.max_error_mm()),
             levels,
@@ -85,7 +88,27 @@ impl Stats {
             file_bytes: format.estimated_bytes(solid),
             format,
             export_units: params.units,
+            pieces: 1,
         }
+    }
+
+    /// Totals over several pieces, with `grid` and `bbox_mm` describing the
+    /// whole drawing they came from.
+    pub fn combine(parts: &[Stats], grid: (usize, usize), bbox_mm: [f32; 3]) -> Option<Self> {
+        let mut out = parts.first()?.clone();
+        for p in &parts[1..] {
+            out.vertices += p.vertices;
+            out.triangles += p.triangles;
+            out.full_triangles += p.full_triangles;
+            out.volume_mm3 += p.volume_mm3;
+            out.filament_g += p.filament_g;
+            out.file_bytes += p.file_bytes;
+            out.achieved_error_mm = out.achieved_error_mm.max(p.achieved_error_mm);
+        }
+        out.grid = grid;
+        out.bbox_mm = bbox_mm;
+        out.pieces = parts.len();
+        Some(out)
     }
 
     /// Is the depth map's quantisation finer than the printer's layers?
