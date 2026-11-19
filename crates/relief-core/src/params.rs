@@ -160,6 +160,9 @@ pub struct Params {
     pub orientation: Orientation,
     /// The unit the exported file is written in. Readouts stay metric.
     pub units: Units,
+    /// For a relief cut from a drawing: print it at the size the drawing says,
+    /// rather than scaling its longest side to [`Params::size_mm`].
+    pub use_drawing_size: bool,
 }
 
 impl Default for Params {
@@ -185,6 +188,7 @@ impl Default for Params {
             layer_mm: 0.1,
             orientation: Orientation::FaceUp,
             units: Units::Mm,
+            use_drawing_size: true,
         }
     }
 }

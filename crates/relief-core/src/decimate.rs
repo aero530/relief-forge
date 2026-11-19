@@ -34,6 +34,15 @@
 //! *shares* the border's indices, which is what keeps the solid watertight by
 //! construction. `check::inspect` asserts it across tolerances.
 //!
+//! # Shaped reliefs
+//!
+//! When the relief is cut to an outline, [`Decimation::build_masked`] takes the
+//! cells that lie wholly inside it. Any block containing a cell outside that
+//! set is forced to subdivide — the same treatment a block hanging over the
+//! grid's edge gets — so the boundary of the simplified surface is a staircase
+//! of single cells, and an outside cell simply emits nothing.
+//! [`crate::shape`] then stitches that staircase to the true outline.
+//!
 //! # A tolerance below the source's step size buys nothing
 //!
 //! An 8-bit depth map over 20 mm of relief quantises to 0.078 mm steps. Ask for
@@ -101,7 +110,11 @@ pub struct Decimation {
     ranks: Vec<u32>,
     member: Vec<u64>,
     /// The surviving border, counter-clockwise from the top-left corner.
+    /// Empty for a masked surface, whose edge is the outline's business.
     border: Vec<u32>,
+    /// Cells that may be part of the surface, row-major over `(w-1) × (h-1)`.
+    /// `None` means all of them.
+    interior: Option<Vec<bool>>,
     triangles: usize,
     tolerance_mm: f32,
     max_error_mm: f32,
@@ -114,6 +127,21 @@ impl Decimation {
         if tolerance_mm <= 0.0 || field.w < 3 || field.h < 3 {
             return None;
         }
+        Some(Self::build_inner(field, tolerance_mm, None))
+    }
+
+    /// Simplify only the cells marked in `interior` (row-major over the
+    /// `(w-1) × (h-1)` cells); the rest emit nothing.
+    ///
+    /// Always returns a decimation, even at zero tolerance, where nothing is
+    /// merged: a shaped surface needs the compact vertex numbering either way,
+    /// so that the grid samples outside the outline are not written to a file.
+    pub fn build_masked(field: &HeightField, tolerance_mm: f32, interior: Vec<bool>) -> Self {
+        assert_eq!(interior.len(), (field.w - 1) * (field.h - 1));
+        Self::build_inner(field, tolerance_mm, Some(interior))
+    }
+
+    fn build_inner(field: &HeightField, tolerance_mm: f32, interior: Option<Vec<bool>>) -> Self {
         let (w, h) = (field.w, field.h);
         let (cells_w, cells_h) = (w - 1, h - 1);
         let pad = cells_w.max(cells_h).next_power_of_two();
@@ -128,16 +156,68 @@ impl Decimation {
             ranks: Vec::new(),
             member: vec![0; w * h / 64 + 1],
             border: Vec::new(),
+            interior,
             triangles: 0,
             tolerance_mm,
             max_error_mm: 0.0,
         };
 
-        let errors = this.pyramid(field, levels);
-        this.decide(&errors, levels, tolerance_mm);
+        let mut errors = this.pyramid(field, levels);
+        this.exclude(&mut errors, levels);
+        // At zero tolerance a masked surface keeps every cell: an exactly flat
+        // block would otherwise still merge, and "zero" promises the full grid.
+        let tolerance = if tolerance_mm > 0.0 {
+            tolerance_mm
+        } else {
+            -1.0
+        };
+        this.decide(&errors, levels, tolerance);
         this.balance(levels);
         this.collect(field);
-        Some(this)
+        this
+    }
+
+    /// Is this cell part of the surface?
+    pub(crate) fn cell_inside(&self, x: usize, y: usize) -> bool {
+        match &self.interior {
+            None => true,
+            Some(mask) => mask[y * (self.w - 1) + x],
+        }
+    }
+
+    /// Force every block that holds an excluded cell to subdivide.
+    ///
+    /// Built bottom-up as an "all inside" pyramid: a block is whole when its
+    /// four children are, and a child hanging off the real grid is not.
+    fn exclude(&self, errors: &mut [Vec<f32>], levels: usize) {
+        let Some(mask) = &self.interior else {
+            return;
+        };
+        let (cells_w, cells_h) = (self.w - 1, self.h - 1);
+        let mut whole: Vec<bool> = (0..self.pad * self.pad)
+            .map(|k| {
+                let (x, y) = (k % self.pad, k / self.pad);
+                x < cells_w && y < cells_h && mask[y * cells_w + x]
+            })
+            .collect();
+        for (level, errors) in errors.iter_mut().enumerate().take(levels + 1).skip(1) {
+            let blocks = self.pad >> level;
+            let below = blocks * 2;
+            let next: Vec<bool> = (0..blocks * blocks)
+                .map(|k| {
+                    let (bx, by) = (k % blocks, k / blocks);
+                    [(0, 0), (1, 0), (0, 1), (1, 1)]
+                        .iter()
+                        .all(|&(dx, dy)| whole[(by * 2 + dy) * below + bx * 2 + dx])
+                })
+                .collect();
+            for (error, &ok) in errors.iter_mut().zip(&next) {
+                if !ok {
+                    *error = f32::INFINITY;
+                }
+            }
+            whole = next;
+        }
     }
 
     /// Largest vertical deviation, in millimetres, between a block's samples and
@@ -305,6 +385,10 @@ impl Decimation {
             running += word.count_ones();
         }
 
+        if self.interior.is_some() {
+            return;
+        }
+
         // The border, in the same counter-clockwise order the frame expects:
         // down the left column, right along the bottom, up the right, back along
         // the top. Whatever survived is what the frame is built on.
@@ -392,6 +476,10 @@ impl Decimation {
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 self.descend(level - 1, bx * 2 + dx, by * 2 + dy, visit);
             }
+            return;
+        }
+        // Outside a shaped surface's outline: nothing here.
+        if level == 0 && !self.cell_inside(x0, y0) {
             return;
         }
         // A leaf stitches to any neighbour that is one level finer.
@@ -531,6 +619,54 @@ mod tests {
             z: vec![-2.0; w * h],
             bits: BitDepth::Sixteen,
         }
+    }
+
+    /// A disc of interior cells in a `w × h` grid.
+    fn disc(w: usize, h: usize) -> Vec<bool> {
+        let (cw, ch) = (w - 1, h - 1);
+        let (cx, cy, r) = (cw as f32 / 2.0, ch as f32 / 2.0, cw.min(ch) as f32 * 0.4);
+        (0..cw * ch)
+            .map(|k| {
+                let (x, y) = ((k % cw) as f32 + 0.5, (k / cw) as f32 + 0.5);
+                (x - cx).powi(2) + (y - cy).powi(2) < r * r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mask_covers_exactly_its_own_cells() {
+        for tolerance in [0.0, 0.01, 0.5, 5.0] {
+            let field = half_and_half(37, 29);
+            let mask = disc(37, 29);
+            let d = Decimation::build_masked(&field, tolerance, mask.clone());
+            let mut covered = vec![0u8; 36 * 28];
+            d.for_each_leaf(|leaf| {
+                for y in leaf.y0..leaf.y0 + leaf.span {
+                    for x in leaf.x0..leaf.x0 + leaf.span {
+                        covered[y * 36 + x] += 1;
+                    }
+                }
+            });
+            for (k, (&c, &m)) in covered.iter().zip(&mask).enumerate() {
+                assert_eq!(c, u8::from(m), "cell {k} at tolerance {tolerance}");
+            }
+            assert!(d.border().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_masked_flat_field_still_simplifies_inside() {
+        let field = flat(65, 65);
+        let mask = disc(65, 65);
+        let cells = mask.iter().filter(|m| **m).count();
+        let d = Decimation::build_masked(&field, 0.1, mask);
+        assert!(d.triangles() < cells, "{} of {}", d.triangles(), 2 * cells);
+        let full = Decimation::build_masked(&field, 0.0, disc(65, 65));
+        assert_eq!(
+            full.triangles(),
+            2 * cells,
+            "zero tolerance keeps every cell"
+        );
     }
 
     #[test]

@@ -63,7 +63,7 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         app.init_resource::<rebuild::Worker>();
-        // Only does anything when RELIEF_SHOT is set.
+        // Only does anything when RELIEF_SHOT or RELIEF_OPEN is set.
         app.add_plugins(shot::plugin);
     }
 

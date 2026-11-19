@@ -4,7 +4,8 @@ Turn a grayscale depth map into a watertight bas-relief you can print. Runs as a
 desktop app and in the browser from the same source.
 
 Feed it the 16-bit
-gray PNG or an ordinary 8-bit gray JPEG.
+gray PNG or an ordinary 8-bit gray JPEG — or a layered SVG drawing, with one
+layer for the heights and another for an outline to cut the model to.
 
 **[Try it in the browser](https://aero530.github.io/relief-forge/)** — the same app, WebGL2, no
 upload: the depth map never leaves your machine. Or install it:
@@ -33,9 +34,41 @@ relief-core   geometry. All the tests that matter.
   export/       STL, PLY, OBJ — streaming writers
   check.rs      closed? oriented? genus 0? what volume?
   stats.rs      the numbers the status bar shows
+  svg.rs        a drawing's layers: heights from one, an outline from another
+  outline.rs    fill rules resolved into separate pieces with holes
+  shape.rs      a relief cut to an outline: collar, walls, back plate
+  cutout.rs     one solid per piece, sharing one depth scale
 relief-app    bevy + egui shell: panels, off-screen 3D view, file IO, debounce
-relief-cli    `relief convert|info|sample`
+relief-cli    `relief convert|info|layers|sample`
 ```
+
+### Cutting to a drawn outline
+
+Open an SVG from Inkscape or Illustrator and pick two of its layers:
+
+- **Height layer** — an embedded 8- or 16-bit grayscale PNG (scaled, rotated or
+  skewed however it was placed), or vector shapes filled with grays and
+  gradients. Same convention as a depth map: dark stands proud, white recedes;
+  **Invert** flips it.
+- **Cutout layer** — closed paths or shapes. Their exact outline becomes the
+  model's edge, not a pixel staircase. Holes and overlaps follow each path's
+  fill rule, separate shapes become **separate models** (one file each:
+  `name-1.stl`, `name-2.stl`, …), and a stroke-only path cuts the same as a
+  filled one. A hidden layer works.
+
+Where the outline reaches past the height data, the model sits at the back of
+the relief, on top of the back plate. The print is the size the drawing says;
+untick **Drawing size** to scale the outline's longest side to **Printed size**
+instead. A cutout has no frame — its sides drop straight to the plate. Choose
+"none" for the cutout to get the ordinary rectangular plaque from the height
+layer alone.
+
+Internally the grid cells wholly inside the outline are the usual (simplified)
+surface, and a narrow constrained-Delaunay *collar* stitches their staircase to
+the true outline using only the vertices of both, so the solid is still closed
+by construction. The test suite checks it with rings, concave shapes, slivers
+thinner than a cell, several pieces, and every simplification setting. It also
+checks that a flat disc comes out with volume πr²·t.
 
 ### Everything physical is millimetres
 
@@ -97,6 +130,10 @@ relief convert depth.png --thickness 0 --emboss 25  # no frame, 25 mm of relief
 relief convert depth.png --tolerance 0              # keep every grid vertex
 relief convert depth.png --format ply --photo face.jpg --check
 relief convert depth.png --units in                 # coordinates written in inches
+relief layers drawing.svg                           # list layers, and the guess
+relief convert drawing.svg --check                  # one watertight file per piece
+relief convert drawing.svg --height-layer Photo --cutout-layer "Cut line" --mm 150
+relief convert drawing.svg --cutout-layer none      # heights only, a plain plaque
 ```
 
 `--check` walks every edge and reports whether the result is watertight. It costs
@@ -124,6 +161,13 @@ Settings JSON is shared between the GUI and `--settings`.
   (Garland–Heckbert's terrain paper) reaches the same tolerance in fewer
   triangles, at the cost of holding the output triangulation in memory. Worth
   revisiting only if the quadtree's counts become the complaint.
+- **Vector height layers are 8-bit.** resvg rasterises at 8 bits per channel,
+  so gray shapes and gradients get 256 levels. Pre-smooth is there for that.
+  An embedded 16-bit image is sampled directly and keeps all of its levels.
+- **Unitless SVGs are a guess.** A `px` or unitless size reads as 96 per inch,
+  or 72 for files Illustrator wrote. The app shows the size it settled on, and
+  Printed size overrides it.
+- **No photo colouring for a cutout.** Choose no cutout to colour a plaque.
 - **2.5D by definition.** One height per pixel: no undercuts, nothing hidden
   behind anything. That is what makes it a relief and not a model of the subject.
 

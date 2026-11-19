@@ -245,16 +245,17 @@ fn simplified_chunks(solid: &Solid, max_verts: usize) -> Vec<TileMesh> {
                 ));
             }
             for vertex in triangle {
-                let (i, j) = match solid.block(vertex as usize) {
-                    crate::mesh::Block::Surface { i, j } => (i, j),
-                    // for_each_surface_triangle only ever emits surface vertices
-                    _ => unreachable!("a surface triangle left the surface"),
-                };
+                // A grid sample, or a shaped outline's top: both lie on the
+                // relief, and take the normal of the nearest grid sample.
+                let [x, y] = solid
+                    .surface_grid(vertex as usize)
+                    .expect("a surface triangle left the surface");
+                let (i, j) = (x.round() as usize, y.round() as usize);
                 current
                     .positions
                     .push(solid.position(vertex as usize).to_array());
                 current.normals.push(normal_at(solid, i, j));
-                current.uvs.push([i as f32 / du, j as f32 / dv]);
+                current.uvs.push([x / du, y / dv]);
             }
         },
         |_| {},

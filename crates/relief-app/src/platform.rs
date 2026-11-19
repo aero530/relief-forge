@@ -31,7 +31,7 @@ pub enum PickKind {
 impl PickKind {
     fn filter(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            PickKind::Depth => ("Depth map", &["png", "jpg", "jpeg"]),
+            PickKind::Depth => ("Depth map or drawing", &["png", "jpg", "jpeg", "svg"]),
             PickKind::Photo => ("Image", &["png", "jpg", "jpeg"]),
             PickKind::Settings => ("Settings", &["json"]),
         }
@@ -74,7 +74,7 @@ impl Inbox {
         self.0.lock().ok()?.take()
     }
 
-    fn put(&self, result: Result<Opened, String>) {
+    pub fn put(&self, result: Result<Opened, String>) {
         if let Ok(mut slot) = self.0.lock() {
             *slot = Some(result);
         }
@@ -154,6 +154,71 @@ pub fn save_stream(
     file.flush()
         .map_err(|e| format!("finishing {}: {e}", path.display()))?;
     Ok(Saved::To(path.display().to_string()))
+}
+
+/// `name.stl` for one file; `name-1.stl`, `name-2.stl`, … for several.
+pub fn numbered(name: &str, k: usize, count: usize) -> String {
+    if count == 1 {
+        return name.to_string();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}-{}.{ext}", k + 1),
+        None => format!("{name}-{}", k + 1),
+    }
+}
+
+/// Ask once for a destination, then write `count` numbered files beside it.
+///
+/// For a cutout with several pieces: one dialog, not one per piece.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_streams(
+    suggested_name: &str,
+    count: usize,
+    mut write: impl FnMut(usize, &mut dyn Write) -> Result<(), String>,
+) -> Result<Saved, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name(suggested_name)
+        .save_file()
+    else {
+        return Ok(Saved::Cancelled);
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| suggested_name.to_string());
+    let mut written = Vec::with_capacity(count);
+    for k in 0..count {
+        let target = path.with_file_name(numbered(&name, k, count));
+        let mut file = std::fs::File::create(&target)
+            .map_err(|e| format!("creating {}: {e}", target.display()))?;
+        write(k, &mut file)?;
+        file.flush()
+            .map_err(|e| format!("finishing {}: {e}", target.display()))?;
+        written.push(target);
+    }
+    Ok(Saved::To(match written.as_slice() {
+        [one] => one.display().to_string(),
+        [first, .., last] => format!(
+            "{} … {}",
+            first.display(),
+            last.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        [] => String::new(),
+    }))
+}
+
+/// One download per piece. Browsers may ask once whether this site may
+/// download several files.
+#[cfg(target_arch = "wasm32")]
+pub fn save_streams(
+    suggested_name: &str,
+    count: usize,
+    mut write: impl FnMut(usize, &mut dyn Write) -> Result<(), String>,
+) -> Result<Saved, String> {
+    for k in 0..count {
+        save_stream(&numbered(suggested_name, k, count), |sink| write(k, sink))?;
+    }
+    Ok(Saved::Downloaded)
 }
 
 /// Stream into a `Blob` and hand it to the browser as a download.

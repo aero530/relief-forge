@@ -36,12 +36,26 @@
 //! why no weld pass is needed: there is no duplicate seam vertex to merge. The
 //! Euler characteristic works out to 2 in both layouts, and
 //! [`crate::check::inspect`] asserts it on real meshes.
+//!
+//! Cut to an outline ([`Solid::shaped`]), there is never a frame, and the
+//! rings are the outline's rather than the grid's — see [`crate::shape`]:
+//!
+//! ```text
+//!   [0 .. S)                interior surface, compact (the masked quadtree)
+//!   [S .. S+B)              edge   — the outline on the surface
+//!   [S+B .. S+2B)           plate  — the outline on the back plate
+//! ```
+//!
+//! The back plate is the outline's own triangulation, so there is no centre
+//! vertex, and each hole through the piece lowers the Euler characteristic by
+//! two.
 
 use glam::Vec3;
 
 use crate::decimate::Decimation;
 use crate::depth::{Albedo, HeightField};
 use crate::params::{Orientation, Params, Units};
+use crate::shape::ShapeMesh;
 
 /// Mid grey, matching upstream's uncoloured vertices.
 pub const FRAME_GREY: [u8; 3] = [0x80, 0x80, 0x80];
@@ -69,6 +83,11 @@ pub struct Layout {
     /// The unit exported coordinates are written in.
     pub units: Units,
     pub orientation: Orientation,
+    /// Where the grid's centre sits in view space. Zero for a whole relief; a
+    /// piece of a shaped one keeps its place in the drawing.
+    pub centre_mm: [f32; 2],
+    /// Footprint in view space: `[min_x, min_y, max_x, max_y]`, frame included.
+    pub bounds_mm: [f32; 4],
 }
 
 impl Layout {
@@ -94,6 +113,7 @@ impl Layout {
         // inside its frame. Centring on `(w - 1) / 2` is the fix.
         let half_w_mm = (w - 1) as f32 * pitch_mm / 2.0;
         let half_h_mm = (h - 1) as f32 * pitch_mm / 2.0;
+        let (ow, oh) = (half_w_mm + thickness_mm, half_h_mm + thickness_mm);
 
         Self {
             w,
@@ -107,6 +127,45 @@ impl Layout {
             emboss_mm: params.emboss_mm,
             units: params.units,
             orientation: params.orientation,
+            centre_mm: [0.0, 0.0],
+            bounds_mm: [-ow, -oh, ow, oh],
+        }
+    }
+
+    /// One piece of a shaped relief: a `w × h` window, at grid `origin`, onto a
+    /// drawing whose full grid is `full` samples at `pitch_mm`.
+    ///
+    /// The window is positioned where it sits in the whole drawing, so pieces
+    /// exported separately can still be put back together. There is no frame.
+    pub fn piece(
+        params: &Params,
+        pitch_mm: f32,
+        full: (usize, usize),
+        origin: (usize, usize),
+        size: (usize, usize),
+        bounds_mm: [f32; 4],
+    ) -> Self {
+        let (w, h) = (size.0.max(2), size.1.max(2));
+        let half_w_mm = (w - 1) as f32 * pitch_mm / 2.0;
+        let half_h_mm = (h - 1) as f32 * pitch_mm / 2.0;
+        let centre_mm = [
+            ((w - 1) as f32 / 2.0 + origin.0 as f32 - (full.0 - 1) as f32 / 2.0) * pitch_mm,
+            ((full.1 - 1) as f32 / 2.0 - origin.1 as f32 - (h - 1) as f32 / 2.0) * pitch_mm,
+        ];
+        Self {
+            w,
+            h,
+            pitch_mm,
+            half_w_mm,
+            half_h_mm,
+            thickness_mm: 0.0,
+            frame_near_mm: 0.0,
+            frame_far_mm: params.frame_far(),
+            emboss_mm: params.emboss_mm,
+            units: params.units,
+            orientation: params.orientation,
+            centre_mm,
+            bounds_mm,
         }
     }
 
@@ -156,9 +215,14 @@ impl Layout {
 
     /// Position of a surface grid vertex.
     fn grid_xy(&self, i: usize, j: usize) -> (f32, f32) {
+        self.grid_point(i as f64, j as f64)
+    }
+
+    /// View-space position of fractional grid coordinates (y down).
+    pub fn grid_point(&self, x: f64, y: f64) -> (f32, f32) {
         (
-            (i as f32 - (self.w - 1) as f32 / 2.0) * self.pitch_mm,
-            ((self.h - 1) as f32 / 2.0 - j as f32) * self.pitch_mm,
+            ((x - (self.w - 1) as f64 / 2.0) * self.pitch_mm as f64) as f32 + self.centre_mm[0],
+            (((self.h - 1) as f64 / 2.0 - y) * self.pitch_mm as f64) as f32 + self.centre_mm[1],
         )
     }
 
@@ -194,9 +258,10 @@ impl Layout {
 
     /// Bounding box in millimetres, in view space.
     pub fn extents_mm(&self) -> Vec3 {
+        let b = self.bounds_mm;
         Vec3::new(
-            2.0 * (self.half_w_mm + self.thickness_mm),
-            2.0 * (self.half_h_mm + self.thickness_mm),
+            b[2] - b[0],
+            b[3] - b[1],
             self.front_mm() - self.frame_far_mm,
         )
     }
@@ -215,7 +280,7 @@ impl Layout {
         match self.orientation {
             Orientation::FaceUp => Vec3::new(p.x, p.y, p.z - self.frame_far_mm),
             // +90° about X: image-up becomes +Z, relief faces -Y.
-            Orientation::Upright => Vec3::new(p.x, -p.z, p.y + self.half_h_mm + self.thickness_mm),
+            Orientation::Upright => Vec3::new(p.x, -p.z, p.y - self.bounds_mm[1]),
         }
     }
 }
@@ -234,6 +299,10 @@ pub enum Block {
     /// The outline dropped to the back plate.
     Back(usize),
     Centre,
+    /// A shaped solid's outline, on the surface.
+    Edge(usize),
+    /// A shaped solid's outline, on the back plate.
+    Plate(usize),
 }
 
 /// A closed relief solid over a borrowed height field.
@@ -245,6 +314,8 @@ pub struct Solid<'a> {
     /// the full grid — and the frame is built on the border *it* leaves behind,
     /// which is what keeps the solid closed by construction either way.
     decimation: Option<&'a Decimation>,
+    /// Cut to an outline: the collar, walls and plate replace the frame.
+    shape: Option<&'a ShapeMesh>,
 }
 
 impl<'a> Solid<'a> {
@@ -254,7 +325,36 @@ impl<'a> Solid<'a> {
             field,
             albedo: None,
             decimation: None,
+            shape: None,
         }
+    }
+
+    /// A solid cut to an outline. `shape` must have been built over `field`.
+    pub fn shaped(field: &'a HeightField, layout: Layout, shape: &'a ShapeMesh) -> Self {
+        Self {
+            layout,
+            field,
+            albedo: None,
+            decimation: Some(shape.decimation()),
+            shape: Some(shape),
+        }
+    }
+
+    pub fn shape(&self) -> Option<&ShapeMesh> {
+        self.shape
+    }
+
+    /// Triangles this solid would have with simplification switched off.
+    pub fn full_triangle_count(&self) -> usize {
+        match self.shape {
+            Some(shape) => shape.full_triangles(),
+            None => self.layout.triangle_count(),
+        }
+    }
+
+    /// `V - E + F` for this solid when it is closed: 2, less two per hole.
+    pub fn expected_euler(&self) -> i64 {
+        2 - 2 * self.shape.map_or(0, |s| s.holes() as i64)
     }
 
     pub fn with_albedo(mut self, albedo: Option<&'a Albedo>) -> Self {
@@ -265,7 +365,10 @@ impl<'a> Solid<'a> {
     /// Use a simplified surface. The height field must be the one it was built
     /// from, or the vertices will not line up.
     pub fn with_decimation(mut self, decimation: Option<&'a Decimation>) -> Self {
-        self.decimation = decimation;
+        // A shaped solid's surface is its own masked decimation, always.
+        if self.shape.is_none() {
+            self.decimation = decimation;
+        }
         self
     }
 
@@ -282,14 +385,20 @@ impl<'a> Solid<'a> {
     }
 
     fn surface_triangles(&self) -> usize {
-        match self.decimation {
-            None => 2 * (self.layout.w - 1) * (self.layout.h - 1),
-            Some(d) => d.triangles(),
-        }
+        let collar = self.shape.map_or(0, |s| s.collar().len());
+        collar
+            + match self.decimation {
+                None => 2 * (self.layout.w - 1) * (self.layout.h - 1),
+                Some(d) => d.triangles(),
+            }
     }
 
-    /// Length of the border cycle the frame is built on.
+    /// Length of the border cycle the frame is built on — for a shaped solid,
+    /// the number of outline vertices.
     pub fn perimeter(&self) -> usize {
+        if let Some(shape) = self.shape {
+            return shape.ring_len();
+        }
         match self.decimation {
             None => self.layout.perimeter(),
             Some(d) => d.border().len(),
@@ -325,10 +434,16 @@ impl<'a> Solid<'a> {
     }
 
     pub fn vertex_count(&self) -> usize {
+        if self.shape.is_some() {
+            return self.surface_vertices() + 2 * self.perimeter();
+        }
         self.surface_vertices() + self.layout.rings() * self.perimeter() + 1
     }
 
     pub fn triangle_count(&self) -> usize {
+        if let Some(shape) = self.shape {
+            return self.surface_triangles() + shape.wall_triangles() + shape.plate().len();
+        }
         self.surface_triangles() + (2 * self.layout.rings() + 1) * self.perimeter()
     }
 
@@ -348,6 +463,13 @@ impl<'a> Solid<'a> {
             };
         }
         let k = index - surface;
+        if self.shape.is_some() {
+            return if k < p {
+                Block::Edge(k)
+            } else {
+                Block::Plate(k - p)
+            };
+        }
         if !l.framed() {
             return if k < p { Block::Back(k) } else { Block::Centre };
         }
@@ -383,6 +505,32 @@ impl<'a> Solid<'a> {
                 Vec3::new(x, y, l.frame_far_mm)
             }
             Block::Centre => Vec3::new(0.0, 0.0, l.frame_far_mm),
+            Block::Edge(k) => {
+                let shape = self.shape.expect("only shaped solids have edges");
+                let [gx, gy] = shape.ring_grid(k);
+                let (x, y) = l.grid_point(gx, gy);
+                Vec3::new(x, y, shape.ring_z(k))
+            }
+            Block::Plate(k) => {
+                let shape = self.shape.expect("only shaped solids have plates");
+                let [gx, gy] = shape.ring_grid(k);
+                let (x, y) = l.grid_point(gx, gy);
+                Vec3::new(x, y, l.frame_far_mm)
+            }
+        }
+    }
+
+    /// Fractional grid coordinates (y down) of a vertex on the relief's own
+    /// surface — a grid sample or a shaped outline's top — for normals and
+    /// texture lookups. `None` for anything belonging to the frame or plate.
+    pub fn surface_grid(&self, index: usize) -> Option<[f32; 2]> {
+        match self.block(index) {
+            Block::Surface { i, j } => Some([i as f32, j as f32]),
+            Block::Edge(k) => self.shape.map(|s| {
+                let [x, y] = s.ring_grid(k);
+                [x as f32, y as f32]
+            }),
+            _ => None,
         }
     }
 
@@ -398,8 +546,8 @@ impl<'a> Solid<'a> {
     /// is not part of the picture, and tinting it with the border pixels reads
     /// as a smear.
     pub fn colour(&self, index: usize) -> [u8; 3] {
-        match (self.block(index), self.albedo) {
-            (Block::Surface { i, j }, Some(a)) => a.at(i, j),
+        match (self.surface_grid(index), self.albedo) {
+            (Some([x, y]), Some(a)) => a.at(x.round() as usize, y.round() as usize),
             _ => FRAME_GREY,
         }
     }
@@ -422,6 +570,16 @@ impl<'a> Solid<'a> {
         mut emit: impl FnMut([u32; 3]),
         mut progress: impl FnMut(f32),
     ) {
+        if let Some(shape) = self.shape {
+            shape
+                .decimation()
+                .for_each_triangle(&mut emit, |t| progress(t * 0.95));
+            for &t in shape.collar() {
+                emit(t);
+            }
+            progress(1.0);
+            return;
+        }
         if let Some(decimation) = self.decimation {
             decimation.for_each_triangle(emit, progress);
             return;
@@ -455,6 +613,29 @@ impl<'a> Solid<'a> {
         let p = self.perimeter();
         let surface = self.surface_vertices();
         let framed = l.framed();
+
+        // Shaped: each outline loop's wall, then the plate's triangulation.
+        // The loops run counter-clockwise outside and clockwise around holes,
+        // so the material is always on the left, exactly as for the
+        // rectangle's border cycle — and the same strip winding applies.
+        if let Some(shape) = self.shape {
+            let edge = surface as u32;
+            let plate = edge + p as u32;
+            for ids in shape.loops() {
+                for k in 0..ids.len() {
+                    let (a, b) = (ids[k], ids[(k + 1) % ids.len()]);
+                    emit([edge + a, plate + b, edge + b]);
+                    emit([edge + a, plate + a, plate + b]);
+                }
+            }
+            progress(0.5);
+            // Counter-clockwise from the front; reversed to face -Z.
+            for &[a, b, c] in shape.plate() {
+                emit([plate + a, plate + c, plate + b]);
+            }
+            progress(1.0);
+            return;
+        }
 
         // Every ring strip is wound the same way, and that is forced, not
         // chosen. The surface's normal faces the viewer, so its boundary runs

@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bevy_egui::egui;
+use relief_core::cutout::Cutout;
 use relief_core::depth::{DepthMap, HeightField, check_aspect};
 use relief_core::export::Format;
 use relief_core::params::Params;
+use relief_core::svg::{self, Drawing};
 use relief_core::{Stats, sample};
 
 use crate::platform::{self, Inbox, Opened, PickKind};
@@ -70,6 +72,19 @@ pub struct Depth {
     pub map: Arc<DepthMap>,
 }
 
+/// A layered drawing, and which of its layers are in use.
+#[derive(Clone)]
+pub struct DrawingSource {
+    pub drawing: Arc<Drawing>,
+    /// The layer the heights come from.
+    pub height: usize,
+    /// The layer whose shapes cut the outline; `None` for a plain rectangle.
+    pub cutout: Option<usize>,
+    /// The chosen layers read out, when there is a cutout. Read once per
+    /// choice of layers, not per rebuild: rasterising a layer is the slow part.
+    pub cut: Option<Arc<Cutout>>,
+}
+
 /// The optional photo, kept as bytes so it can be re-sampled to whatever grid
 /// the current parameters produce.
 #[derive(Clone)]
@@ -93,6 +108,8 @@ pub struct AppState {
     /// The parameters the current preview was built from.
     pub applied: Option<Params>,
     pub depth: Depth,
+    /// Set when the depth came from an SVG drawing.
+    pub drawing: Option<DrawingSource>,
     pub photo: Option<Photo>,
     pub inbox: Inbox,
     pub status: Status,
@@ -121,6 +138,7 @@ impl Default for AppState {
                 name: "sample_terrain_16bit.png".into(),
                 map: Arc::new(map),
             },
+            drawing: None,
             photo: None,
             inbox: Inbox::default(),
             status: Status::info("Sample depth map loaded — open your own to replace it."),
@@ -150,6 +168,68 @@ impl AppState {
     pub fn touch(&mut self, now: f64) {
         self.dirty_since = Some(now);
         self.save_since = Some(now);
+    }
+
+    /// The cutout in use, if the depth is a drawing cut to an outline.
+    pub fn cut(&self) -> Option<&Arc<Cutout>> {
+        self.drawing.as_ref().and_then(|d| d.cut.as_ref())
+    }
+
+    /// Does the model have a bezel? Never when it is cut to an outline.
+    pub fn framed(&self) -> bool {
+        self.params.framed() && self.cut().is_none()
+    }
+
+    /// Read the chosen layers of the loaded drawing into the depth slot.
+    ///
+    /// On failure the previous choice stays in place and the status says why.
+    pub fn choose_layers(&mut self, height: usize, cutout: Option<usize>, now: f64) {
+        let Some(source) = &self.drawing else {
+            return;
+        };
+        let drawing = source.drawing.clone();
+        let label = |k: usize| drawing.layers()[k].label.clone();
+        let read = match cutout {
+            Some(c) => drawing
+                .cutout(height, c)
+                .map(|cut| (Arc::new(cut.map.clone()), Some(Arc::new(cut)))),
+            None => drawing.plain(height).map(|map| (Arc::new(map), None)),
+        };
+        match read {
+            Err(e) => self.status = Status::error(e.to_string()),
+            Ok((map, cut)) => {
+                let pieces = cut.as_ref().map(|c| c.outline.pieces.len());
+                let mut note = match (cutout, pieces) {
+                    (Some(c), Some(n)) => format!(
+                        "Heights from \"{}\", cut by \"{}\" — {} piece{}",
+                        label(height),
+                        label(c),
+                        n,
+                        if n == 1 { "" } else { "s, one file each" }
+                    ),
+                    _ => format!("Heights from \"{}\", no cutout", label(height)),
+                };
+                let mut tone = Tone::Info;
+                if map.was_colour {
+                    note.push_str(" · colour converted to luma");
+                    tone = Tone::Warn;
+                }
+                if cut.is_some() && self.photo.is_some() {
+                    note.push_str(" · the photo is not used with a cutout");
+                    self.photo = None;
+                    self.photo_texture = None;
+                }
+                self.depth.map = map;
+                self.drawing = Some(DrawingSource {
+                    drawing,
+                    height,
+                    cutout,
+                    cut,
+                });
+                self.status = Status { text: note, tone };
+                self.touch(now);
+            }
+        }
     }
 
     pub fn stats(&self) -> Option<&Stats> {
@@ -203,6 +283,38 @@ pub fn apply_opened(mut state: ResMut<AppState>, time: Res<Time>) {
         Err(message) => state.status = Status::error(message),
         Ok(Opened::Cancelled) => {}
         Ok(Opened::File { kind, name, bytes }) => match kind {
+            PickKind::Depth if svg::sniff(&bytes) => match Drawing::parse(&bytes) {
+                Err(e) => state.status = Status::error(format!("{name}: {e}")),
+                Ok(drawing) => {
+                    let (height, cutout) = drawing.guess_layers();
+                    let previous = (state.depth.clone(), state.drawing.take());
+                    state.depth.name = name;
+                    state.drawing = Some(DrawingSource {
+                        drawing: Arc::new(drawing),
+                        height,
+                        cutout,
+                        cut: None,
+                    });
+                    state.choose_layers(height, cutout, now);
+                    // A wrong guess at the cutout should not lose the drawing:
+                    // fall back to no cutout, and the pickers are there to fix it.
+                    if state.status.tone == Tone::Error && cutout.is_some() {
+                        let reason = state.status.text.clone();
+                        state.choose_layers(height, None, now);
+                        if state.status.tone != Tone::Error {
+                            state.status = Status::warn(format!(
+                                "{reason} — showing the heights uncut; choose a cutout layer"
+                            ));
+                        }
+                    }
+                    // Nothing usable in it: put back what was there.
+                    if state.status.tone == Tone::Error {
+                        let message = state.status.text.clone();
+                        (state.depth, state.drawing) = previous;
+                        state.status = Status::error(message);
+                    }
+                }
+            },
             PickKind::Depth => match DepthMap::decode(&bytes) {
                 Err(e) => state.status = Status::error(format!("{name}: {e}")),
                 Ok(map) => {
@@ -231,10 +343,16 @@ pub fn apply_opened(mut state: ResMut<AppState>, time: Res<Time>) {
                         name,
                         map: Arc::new(map),
                     };
+                    state.drawing = None;
                     state.status = Status { text: note, tone };
                     state.touch(now);
                 }
             },
+            PickKind::Photo if state.cut().is_some() => {
+                state.status = Status::warn(
+                    "A photo cannot colour a cutout drawing — choose \"no cutout\" to use one",
+                );
+            }
             PickKind::Photo => match image::load_from_memory(&bytes) {
                 Err(e) => state.status = Status::error(format!("{name}: {e}")),
                 Ok(decoded) => {

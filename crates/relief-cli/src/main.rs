@@ -8,9 +8,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use relief_core::cutout::{CutRelief, Cutout};
 use relief_core::depth::{Albedo, BitDepth, DepthMap, check_aspect};
 use relief_core::export::{self, Format};
 use relief_core::params::{Orientation, Params, Units};
+use relief_core::svg::{self, Drawing};
 use relief_core::{Decimation, Solid, Stats, check, sample, stats};
 
 #[derive(Parser)]
@@ -26,9 +28,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Convert a depth map to a printable mesh.
+    /// Convert a depth map, or a layered SVG drawing, to a printable mesh.
+    ///
+    /// A drawing whose cutout has several separate pieces writes one file per
+    /// piece, numbered: `name-1.stl`, `name-2.stl`, …
     Convert {
-        /// 16-bit PNG, 8-bit PNG, or JPEG.
+        /// 16-bit PNG, 8-bit PNG, JPEG, or SVG.
         depth: PathBuf,
         /// Where to write. Defaults to the input's name with the format's
         /// extension.
@@ -44,6 +49,8 @@ enum Command {
         #[arg(long)]
         check: bool,
         #[command(flatten)]
+        layers: LayerArgs,
+        #[command(flatten)]
         params: ParamArgs,
     },
     /// Report what a conversion would produce, without writing it.
@@ -52,8 +59,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = FormatArg::Stl)]
         format: FormatArg,
         #[command(flatten)]
+        layers: LayerArgs,
+        #[command(flatten)]
         params: ParamArgs,
     },
+    /// List an SVG drawing's layers, and which would be used for what.
+    Layers { drawing: PathBuf },
     /// Write a synthetic depth map, for trying the app out.
     Sample {
         #[arg(short, long, default_value = "sample_depth_16bit.png")]
@@ -97,6 +108,20 @@ enum OrientationArg {
     Upright,
 }
 
+/// Which layers of an SVG drawing to use. Ignored for raster inputs.
+#[derive(Args, Clone)]
+struct LayerArgs {
+    /// Layer holding the heights — an embedded image, or gray shapes and
+    /// gradients. A name, or a number from `relief layers`. Defaults to the
+    /// first layer with an image in it.
+    #[arg(long)]
+    height_layer: Option<String>,
+    /// Layer whose shapes cut the outline, or `none` for a plain rectangle.
+    /// Defaults to the topmost other layer with shapes and no images.
+    #[arg(long)]
+    cutout_layer: Option<String>,
+}
+
 /// Every geometry knob, as an override on top of the defaults or a settings
 /// file. `None` means "leave whatever was there", so `--settings` and individual
 /// flags compose the way a person expects.
@@ -120,7 +145,8 @@ struct ParamArgs {
     /// Longest side of the mesh grid, in pixels.
     #[arg(long)]
     px: Option<u32>,
-    /// Longest outer side of the printed plaque, in millimetres.
+    /// Longest outer side of the printed plaque, in millimetres. For a cutout
+    /// drawing, the outline's longest side — instead of the drawing's own size.
     #[arg(long)]
     mm: Option<f32>,
     /// Median window: 1, 3 or 5.
@@ -181,6 +207,7 @@ impl ParamArgs {
         }
         if let Some(v) = self.mm {
             p.size_mm = v;
+            p.use_drawing_size = false;
         }
         if let Some(v) = self.smooth {
             p.filter_size = v;
@@ -237,13 +264,24 @@ fn run() -> Result<(), String> {
             photo,
             format,
             check: run_check,
+            layers,
             params,
-        } => convert(&depth, out, photo, format.into(), run_check, &params),
+        } => convert(
+            &depth,
+            out,
+            photo,
+            format.into(),
+            run_check,
+            &layers,
+            &params,
+        ),
         Command::Info {
             depth,
             format,
+            layers,
             params,
-        } => info(&depth, format.into(), &params),
+        } => info(&depth, format.into(), &layers, &params),
+        Command::Layers { drawing } => list_layers(&drawing),
         Command::Sample {
             out,
             width,
@@ -253,9 +291,114 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn load_depth(path: &Path) -> Result<DepthMap, String> {
+/// What an input file turned out to be.
+enum Source {
+    Plain(DepthMap),
+    Cut(Cutout),
+}
+
+fn load(path: &Path, layers: &LayerArgs) -> Result<Source, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    DepthMap::decode(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+    let at = |e: relief_core::Error| format!("{}: {e}", path.display());
+    if !svg::sniff(&bytes) {
+        return DepthMap::decode(&bytes).map(Source::Plain).map_err(at);
+    }
+    let drawing = Drawing::parse(&bytes).map_err(at)?;
+    let (guess_height, guess_cutout) = drawing.guess_layers();
+    let height = match &layers.height_layer {
+        Some(name) => pick_layer(&drawing, name)?,
+        None => guess_height,
+    };
+    let cutout = match layers.cutout_layer.as_deref() {
+        Some(name) if name.eq_ignore_ascii_case("none") => None,
+        Some(name) => Some(pick_layer(&drawing, name)?),
+        None => guess_cutout,
+    };
+    let label = |k: usize| drawing.layers()[k].label.clone();
+    match cutout {
+        None => {
+            eprintln!("  heights from \"{}\", no cutout", label(height));
+            drawing.plain(height).map(Source::Plain).map_err(at)
+        }
+        Some(cut) => {
+            eprintln!(
+                "  heights from \"{}\", cut by \"{}\"",
+                label(height),
+                label(cut)
+            );
+            drawing.cutout(height, cut).map(Source::Cut).map_err(at)
+        }
+    }
+}
+
+/// A layer by 1-based number or by label, ignoring case.
+fn pick_layer(drawing: &Drawing, name: &str) -> Result<usize, String> {
+    let layers = drawing.layers();
+    if let Ok(n) = name.parse::<usize>()
+        && (1..=layers.len()).contains(&n)
+    {
+        return Ok(n - 1);
+    }
+    layers
+        .iter()
+        .position(|l| l.label.eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            let names: Vec<_> = layers.iter().map(|l| format!("\"{}\"", l.label)).collect();
+            format!(
+                "no layer called \"{name}\"; the drawing has {}",
+                names.join(", ")
+            )
+        })
+}
+
+fn list_layers(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let drawing = Drawing::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let [w, h] = drawing.size_mm();
+    println!("{}: {w:.1} × {h:.1} mm", path.display());
+    let (height, cutout) = drawing.guess_layers();
+    for (k, layer) in drawing.layers().iter().enumerate() {
+        let role = if k == height {
+            "  ← heights"
+        } else if Some(k) == cutout {
+            "  ← cutout"
+        } else {
+            ""
+        };
+        println!("  {:>2}  {}{role}", k + 1, layer.summary());
+    }
+    Ok(())
+}
+
+/// Stats for a cutout: every piece's, totalled over the drawing.
+fn cut_stats(relief: &CutRelief, format: Format, params: &Params) -> Stats {
+    let parts: Vec<Stats> = relief
+        .pieces
+        .iter()
+        .map(|p| Stats::new(&p.solid(), format, params))
+        .collect();
+    Stats::combine(
+        &parts,
+        (relief.field.w, relief.field.h),
+        relief.extents_mm(params),
+    )
+    .expect("a built cutout has at least one piece")
+}
+
+/// `name.stl` for one piece; `name-1.stl`, `name-2.stl`, … for several.
+fn piece_path(out: &Path, k: usize, count: usize) -> PathBuf {
+    if count == 1 {
+        return out.to_path_buf();
+    }
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let name = match out.extension() {
+        Some(ext) => format!("{stem}-{}.{}", k + 1, ext.to_string_lossy()),
+        None => format!("{stem}-{}", k + 1),
+    };
+    out.with_file_name(name)
 }
 
 fn convert(
@@ -264,10 +407,33 @@ fn convert(
     photo_path: Option<PathBuf>,
     format: Format,
     run_check: bool,
+    layers: &LayerArgs,
     args: &ParamArgs,
 ) -> Result<(), String> {
     let params = args.resolve()?;
-    let depth = load_depth(depth_path)?;
+    let out = out.unwrap_or_else(|| depth_path.with_extension(format.extension()));
+    let depth = match load(depth_path, layers)? {
+        Source::Plain(depth) => depth,
+        Source::Cut(cutout) => {
+            if photo_path.is_some() {
+                eprintln!("relief: warning: --photo is not used with a cutout drawing");
+            }
+            let relief = cutout
+                .build(&params)
+                .map_err(|e| format!("{}: {e}", depth_path.display()))?;
+            report(&cut_stats(&relief, format, &params), &params);
+            let count = relief.pieces.len();
+            for (k, piece) in relief.pieces.iter().enumerate() {
+                write_solid(
+                    &piece.solid(),
+                    format,
+                    &piece_path(&out, k, count),
+                    run_check,
+                )?;
+            }
+            return Ok(());
+        }
+    };
     let field = depth
         .to_height_field(&params)
         .map_err(|e| format!("{}: {e}", depth_path.display()))?;
@@ -298,16 +464,17 @@ fn convert(
     let solid = Solid::new(&field, &params)
         .with_albedo(albedo.as_ref())
         .with_decimation(decimation.as_ref());
-    let out = out.unwrap_or_else(|| depth_path.with_extension(format.extension()));
-
     let stats = Stats::new(&solid, format, &params);
     report(&stats, &params);
+    write_solid(&solid, format, &out, run_check)
+}
 
-    let file =
-        std::fs::File::create(&out).map_err(|e| format!("creating {}: {e}", out.display()))?;
-    let mut file = file;
+/// Stream one solid to a file, and optionally prove it closed.
+fn write_solid(solid: &Solid, format: Format, out: &Path, run_check: bool) -> Result<(), String> {
+    let mut file =
+        std::fs::File::create(out).map_err(|e| format!("creating {}: {e}", out.display()))?;
     let mut last_percent = -1i32;
-    export::write(format, &solid, &mut file, &mut |t| {
+    export::write(format, solid, &mut file, &mut |t| {
         let percent = (t * 100.0) as i32;
         if percent > last_percent {
             last_percent = percent;
@@ -316,17 +483,21 @@ fn convert(
         }
     })
     .map_err(|e| format!("writing {}: {e}", out.display()))?;
+    let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "\r  wrote {} ({})           ",
         out.display(),
-        stats.file_line()
+        stats::human_bytes(bytes)
     );
 
     if run_check {
         eprint!("  checking the mesh… ");
-        let report = check::inspect(&solid);
+        let report = check::inspect(solid);
         match report.watertight() {
-            Some(true) => println!("watertight: closed, genus 0, outward-wound"),
+            Some(true) => println!(
+                "watertight: closed, genus {}, outward-wound",
+                (2 - report.expected_euler) / 2
+            ),
             _ => {
                 println!(
                     "NOT watertight: {} open edge(s), {} non-manifold edge(s), euler {:?}",
@@ -341,9 +512,31 @@ fn convert(
     Ok(())
 }
 
-fn info(depth_path: &Path, format: Format, args: &ParamArgs) -> Result<(), String> {
+fn info(
+    depth_path: &Path,
+    format: Format,
+    layers: &LayerArgs,
+    args: &ParamArgs,
+) -> Result<(), String> {
     let params = args.resolve()?;
-    let depth = load_depth(depth_path)?;
+    let depth = match load(depth_path, layers)? {
+        Source::Plain(depth) => depth,
+        Source::Cut(cutout) => {
+            let relief = cutout
+                .build(&params)
+                .map_err(|e| format!("{}: {e}", depth_path.display()))?;
+            let [w, h] = cutout.size_mm;
+            println!(
+                "{}: cutout {w:.1} × {h:.1} mm in the drawing, heights {}×{} {}",
+                depth_path.display(),
+                cutout.map.width,
+                cutout.map.height,
+                cutout.map.bits.label()
+            );
+            report(&cut_stats(&relief, format, &params), &params);
+            return Ok(());
+        }
+    };
     let field = depth
         .to_height_field(&params)
         .map_err(|e| format!("{}: {e}", depth_path.display()))?;
@@ -386,7 +579,13 @@ fn report(stats: &Stats, _params: &Params) {
     println!(
         "  size       {}{}",
         stats.bbox_line(),
-        if stats.framed { "" } else { "  (no frame)" }
+        if stats.pieces > 1 {
+            format!("  ({} separate pieces, one file each)", stats.pieces)
+        } else if stats.framed {
+            String::new()
+        } else {
+            "  (no frame)".into()
+        }
     );
     println!("  relief     {}", stats.relief_line());
     println!("  levels     {} ({})", stats.levels, stats.bits.label());

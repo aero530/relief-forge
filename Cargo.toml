@@ -3,10 +3,10 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
-authors = ["P. Spindler <aero530@gmail.com>"]
+authors = ["aero530@gmail.com"]
 repository = "https://github.com/aero530/relief-forge"
 # Driven by bevy 0.19 / bevy_egui 0.42 / egui 0.36, which all declare 1.95.
 rust-version = "1.95"
@@ -25,6 +25,18 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 # Only the two codecs we accept, so the wasm bundle carries no dead decoders.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# SVG import. No text (it would pull in fonts), no system font discovery:
+# a cutout or a height layer is geometry and paint, and text in either is
+# expected to have been converted to paths by the drawing program.
+# resvg re-exports the usvg parser and the tiny-skia rasteriser it was built
+# against, and those re-exports are what relief-core uses, so there is one
+# version of each in the tree.
+resvg = { version = "0.50", default-features = false, features = ["raster-images"] }
+# Fill-rule resolution of the cutout into pieces with holes.
+i_overlay = "9"
+# Constrained Delaunay triangulation of the outline's collar and back plate.
+spade = "2"
 
 # --- Bevy stack: pinned as a unit. ---
 # bevy_panorbit_camera's `bevy_egui` feature wants bevy_egui ^0.40 while we run

@@ -24,6 +24,9 @@ pub struct Report {
     pub edges: Option<usize>,
     /// `V - E + F`. 2 for a closed surface of genus 0.
     pub euler: Option<i64>,
+    /// What `euler` has to be for this solid: 2, less two for every hole a
+    /// shaped piece has through it.
+    pub expected_euler: i64,
     /// Edges used by only one triangle: a hole.
     pub boundary_edges: Option<usize>,
     /// Directed edges used more than once: two faces wound the same way across
@@ -42,7 +45,7 @@ impl Report {
         Some(
             self.boundary_edges? == 0
                 && self.non_manifold_edges? == 0
-                && self.euler? == 2
+                && self.euler? == self.expected_euler
                 && self.volume_mm3 > 0.0,
         )
     }
@@ -58,6 +61,7 @@ pub fn summary(solid: &Solid) -> Report {
         triangles: solid.triangle_count(),
         edges: None,
         euler: None,
+        expected_euler: solid.expected_euler(),
         boundary_edges: None,
         non_manifold_edges: None,
         volume_mm3: volume,

@@ -13,6 +13,9 @@ glam.workspace = true
 image.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+resvg.workspace = true
+i_overlay.workspace = true
+spade.workspace = true
 
 # Row-parallel filtering and normal generation. Not available on wasm (no
 # threads without cross-origin isolation), where the serial path runs instead.
